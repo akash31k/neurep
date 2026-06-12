@@ -1,0 +1,957 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from matplotlib.animation import FuncAnimation
+from collections import defaultdict
+import heapq   # For A* priority queue
+import time
+
+# =============================================================================
+# CONFIGURATION — tune these numbers to change drone behaviour
+# =============================================================================
+
+# World size (metres)
+WORLD_W = 80
+WORLD_H = 60
+
+# Drone start and goal positions (x, y)
+START = np.array([5.0, 30.0])
+GOAL  = np.array([75.0, 30.0])
+
+# Occupancy grid resolution: each cell = GRID_RES x GRID_RES metres
+GRID_RES = 0.5
+
+# Drone flight parameters
+DRONE_SPEED   = 0.8   # metres per simulation step
+DRONE_RADIUS  = 1.0   # metres (physical size, for safety margin)
+GOAL_RADIUS   = 2.0   # metres — how close = "arrived"
+
+# LiDAR parameters
+LIDAR_RANGE   = 12.0  # metres (max detection distance)
+LIDAR_RAYS    = 72    # number of rays (360 / 72 = every 5 degrees)
+
+# APF parameters
+K_ATT         = 1.0   # attractive force gain
+K_REP         = 80.0  # repulsive force gain (larger = more aggressive avoidance)
+REP_RANGE     = 5.0   # metres — obstacles beyond this distance are ignored
+
+# Stuck detection
+STUCK_THRESHOLD    = 0.3   # metres — if moved less than this in STUCK_WINDOW steps, stuck
+STUCK_WINDOW       = 30    # number of steps to check for being stuck
+STUCK_ESCAPE_STEPS = 60    # how many A* steps to take before re-enabling APF
+
+# Simulation
+MAX_STEPS     = 3000
+DT            = 1.0   # time step (arbitrary units — affects animation speed)
+
+# Random seed (change this number to get different obstacle layouts!)
+RANDOM_SEED   = 42
+
+# =============================================================================
+# OBSTACLE DEFINITIONS
+# =============================================================================
+# Each obstacle is defined as a polygon (list of (x,y) vertices).
+# The LiDAR sensor doesn't know these — it discovers them by scanning.
+
+def create_obstacles():
+    """
+    Create a list of polygonal obstacles.
+    In a real drone, these would be unknown — the LiDAR discovers them.
+    Here we define them so we can draw them and check for collisions.
+
+    Returns a list of numpy arrays, each shape (N, 2).
+    """
+    obstacles = []
+
+    # --- Obstacle 1: tall rectangular wall ---
+    # x_left, y_bottom, width, height
+    obstacles.append(rect_poly(20, 10, 3, 30))
+
+    # --- Obstacle 2: diagonal block ---
+    obstacles.append(np.array([
+        [35, 15], [42, 18], [40, 35], [33, 32]
+    ], dtype=float))
+
+    # --- Obstacle 3: U-shaped trap (tests stuck detection!) ---
+    # Three rectangles forming a U
+    obstacles.append(rect_poly(52, 22, 12, 3))   # bottom bar
+    obstacles.append(rect_poly(52, 22,  3, 14))  # left wall
+    obstacles.append(rect_poly(61, 22,  3, 14))  # right wall
+
+    # --- Obstacle 4: small circular-ish obstacle ---
+    obstacles.append(circle_poly(60, 45, 3.5, 8))
+
+    return obstacles
+
+def rect_poly(x, y, w, h):
+    """Helper: return a rectangular polygon as a numpy array of 4 corners."""
+    return np.array([
+        [x,   y],
+        [x+w, y],
+        [x+w, y+h],
+        [x,   y+h]
+    ], dtype=float)
+
+def circle_poly(cx, cy, r, n_pts=12):
+    """Helper: approximate a circle as an n-point polygon."""
+    angles = np.linspace(0, 2*np.pi, n_pts, endpoint=False)
+    return np.column_stack([
+        cx + r * np.cos(angles),
+        cy + r * np.sin(angles)
+    ])
+
+# =============================================================================
+# GEOMETRY HELPERS
+# =============================================================================
+
+def point_in_polygon(point, polygon):
+    """
+    Ray casting algorithm — checks if a 2D point is inside a polygon.
+    Sends a ray from the point to the right and counts how many times
+    it crosses the polygon boundary. Odd crossings = inside.
+
+    This is used by the LiDAR to check if a ray endpoint hit an obstacle.
+    """
+    x, y = point
+    n = len(polygon)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        # Check if horizontal ray from (x,y) crosses edge (xi,yi)-(xj,yj)
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+def segment_polygon_intersection(p1, p2, polygon):
+    """
+    Find the closest intersection point of line segment p1->p2
+    with the edges of a polygon.
+
+    Used by LiDAR to find exactly where each ray hits an obstacle.
+    Returns the distance to the hit, or None if no hit.
+    """
+    min_t = None
+    dx, dy = p2 - p1
+
+    n = len(polygon)
+    for i in range(n):
+        # Edge of polygon: A -> B
+        A = polygon[i]
+        B = polygon[(i + 1) % n]
+        ex, ey = B - A
+
+        # Solve parametric intersection:
+        #   P(t) = p1 + t*(p2-p1)
+        #   Q(s) = A  + s*(B-A)
+        # Intersection when P(t) = Q(s)
+        denom = dx * ey - dy * ex
+        if abs(denom) < 1e-10:
+            continue  # parallel lines, no intersection
+
+        t = ((A[0] - p1[0]) * ey - (A[1] - p1[1]) * ex) / denom
+        s = ((A[0] - p1[0]) * dy - (A[1] - p1[1]) * dx) / denom
+
+        if 0 <= t <= 1 and 0 <= s <= 1:
+            if min_t is None or t < min_t:
+                min_t = t
+
+    if min_t is not None:
+        # Return actual distance along the ray
+        return min_t * np.linalg.norm(p2 - p1)
+    return None
+
+# =============================================================================
+# OCCUPANCY GRID
+# =============================================================================
+
+class OccupancyGrid:
+    """
+    A 2D grid representing the drone's map of the world.
+
+    Cells are: 0 = unknown/free, 1 = occupied (obstacle detected)
+
+    Think of this as the drone's "memory" — it starts empty and
+    gets filled in as the LiDAR scans the surroundings.
+
+    Grid indices: grid[row, col] where
+      col = int(x / GRID_RES)
+      row = int(y / GRID_RES)
+    """
+
+    def __init__(self, world_w, world_h, res):
+        self.res = res
+        self.cols = int(world_w / res) + 1
+        self.rows = int(world_h / res) + 1
+        # Initialize all cells to free (0)
+        self.grid = np.zeros((self.rows, self.cols), dtype=np.uint8)
+
+    def world_to_grid(self, x, y):
+        """Convert world coordinates (metres) to grid cell indices."""
+        col = int(np.clip(x / self.res, 0, self.cols - 1))
+        row = int(np.clip(y / self.res, 0, self.rows - 1))
+        return row, col
+
+    def grid_to_world(self, row, col):
+        """Convert grid indices back to world coordinates (cell centre)."""
+        x = (col + 0.5) * self.res
+        y = (row + 0.5) * self.res
+        return np.array([x, y])
+
+    def mark_occupied(self, x, y):
+        """Mark the cell containing world point (x,y) as occupied."""
+        row, col = self.world_to_grid(x, y)
+        self.grid[row, col] = 1
+
+    def is_occupied(self, x, y):
+        """Check if the cell at world point (x,y) is occupied."""
+        row, col = self.world_to_grid(x, y)
+        return self.grid[row, col] == 1
+
+    def is_free(self, x, y):
+        """Check if the cell at world point (x,y) is free."""
+        return not self.is_occupied(x, y)
+
+    def get_obstacle_points(self, drone_pos, radius):
+        """
+        Return world-coordinate centres of all occupied cells
+        within 'radius' metres of drone_pos.
+
+        Used by APF to compute repulsive forces only from nearby obstacles.
+        This makes APF efficient — we don't check the whole map every step.
+        """
+        r_cells = int(radius / self.res) + 1
+        dr, dc = self.world_to_grid(*drone_pos)
+
+        points = []
+        for row in range(max(0, dr - r_cells), min(self.rows, dr + r_cells + 1)):
+            for col in range(max(0, dc - r_cells), min(self.cols, dc + r_cells + 1)):
+                if self.grid[row, col] == 1:
+                    wx, wy = self.grid_to_world(row, col)
+                    dist = np.linalg.norm(np.array([wx, wy]) - drone_pos)
+                    if dist <= radius:
+                        points.append(np.array([wx, wy]))
+        return points
+
+# =============================================================================
+# LIDAR SENSOR SIMULATION
+# =============================================================================
+
+class LiDAR:
+    """
+    Simulates a 2D scanning LiDAR sensor.
+
+    A real LiDAR (like RPLIDAR) spins a laser and measures return times.
+    We simulate this by casting rays in all directions and finding where
+    each ray first intersects an obstacle polygon.
+
+    Output: for each angle, a distance reading (or max_range if no hit).
+    """
+
+    def __init__(self, max_range, n_rays):
+        self.max_range = max_range
+        self.n_rays    = n_rays
+        # Pre-compute the angles for each ray (in radians)
+        self.angles = np.linspace(0, 2 * np.pi, n_rays, endpoint=False)
+
+    def scan(self, drone_pos, obstacles):
+        """
+        Perform one full 360° scan from drone_pos.
+
+        For each ray angle:
+          1. Compute the ray endpoint (at max range)
+          2. Check each obstacle polygon for intersection
+          3. Record the closest hit distance
+
+        Returns:
+          distances: array of shape (n_rays,), distances to obstacles
+          hit_points: array of shape (n_rays, 2), world coords of hits
+        """
+        distances  = np.full(self.n_rays, self.max_range)
+        hit_points = np.zeros((self.n_rays, 2))
+
+        for i, angle in enumerate(self.angles):
+            # Ray direction unit vector
+            direction = np.array([np.cos(angle), np.sin(angle)])
+            ray_end   = drone_pos + direction * self.max_range
+
+            # Check all obstacles for intersection
+            min_dist = self.max_range
+            for obs in obstacles:
+                d = segment_polygon_intersection(drone_pos, ray_end, obs)
+                if d is not None and d < min_dist:
+                    min_dist = d
+
+            distances[i]    = min_dist
+            hit_points[i]   = drone_pos + direction * min_dist
+
+        return distances, hit_points
+
+    def update_map(self, drone_pos, distances, hit_points, occ_grid):
+        """
+        After scanning, update the occupancy grid with what we found.
+
+        For each ray that hit something (distance < max_range):
+          - Mark the hit point as OCCUPIED
+
+        Note: In advanced SLAM systems, you'd also mark the FREE space
+        along each ray. We keep it simple here.
+        """
+        for i in range(self.n_rays):
+            if distances[i] < self.max_range - 0.1:
+                # Ray hit something — mark that cell as occupied
+                hx, hy = hit_points[i]
+                # Mark a small cluster of cells (to account for sensor noise)
+                for dx in [-GRID_RES/2, 0, GRID_RES/2]:
+                    for dy in [-GRID_RES/2, 0, GRID_RES/2]:
+                        occ_grid.mark_occupied(hx + dx, hy + dy)
+
+# =============================================================================
+# ARTIFICIAL POTENTIAL FIELD (APF)
+# =============================================================================
+
+class APF:
+    """
+    Artificial Potential Field navigation.
+
+    The drone is treated like a particle in a force field:
+      - The GOAL creates an attractive potential (like a valley, drone rolls down)
+      - OBSTACLES create repulsive potentials (like hills, drone rolls away)
+
+    The drone moves in the direction of the net force (gradient descent
+    on the total potential).
+
+    MATHEMATICS (simplified):
+      U_att(q) = 0.5 * k_att * ||q - q_goal||^2
+      F_att    = -grad(U_att) = k_att * (q_goal - q)
+
+      For each obstacle o within REP_RANGE:
+        d = distance(q, o)
+        U_rep(q) = 0.5 * k_rep * (1/d - 1/REP_RANGE)^2  if d < REP_RANGE
+        F_rep    = k_rep * (1/d - 1/REP_RANGE) * (1/d^2) * (q - o) / ||q-o||
+
+      F_total = F_att + sum(F_rep)
+      velocity = normalize(F_total) * DRONE_SPEED
+    """
+
+    def __init__(self, k_att, k_rep, rep_range):
+        self.k_att    = k_att
+        self.k_rep    = k_rep
+        self.rep_range = rep_range
+
+    def attractive_force(self, drone_pos, goal_pos):
+        """
+        Compute the attractive force pulling drone toward goal.
+
+        The force grows linearly with distance — farther away = stronger pull.
+        Direction: always points from drone toward goal.
+        """
+        diff  = goal_pos - drone_pos
+        force = self.k_att * diff
+        return force
+
+    def repulsive_force(self, drone_pos, obstacle_points):
+        """
+        Compute the total repulsive force from all nearby obstacles.
+
+        For each nearby obstacle cell:
+          - Compute distance
+          - If within REP_RANGE: apply inverse-square repulsion
+          - Direction: pushes drone directly away from obstacle
+
+        The (1/d - 1/REP_RANGE) term ensures force is 0 at the boundary
+        and smoothly increases as drone gets closer.
+        """
+        total_rep = np.zeros(2)
+
+        for obs_pt in obstacle_points:
+            diff = drone_pos - obs_pt
+            d    = np.linalg.norm(diff)
+
+            # Safety check — avoid division by zero
+            if d < 0.01:
+                d = 0.01
+
+            if d < self.rep_range:
+                # Repulsive magnitude: larger when close
+                magnitude = self.k_rep * (1.0/d - 1.0/self.rep_range) * (1.0 / d**2)
+                direction = diff / d  # unit vector pointing away from obstacle
+                total_rep += magnitude * direction
+
+        return total_rep
+
+    def compute_velocity(self, drone_pos, goal_pos, obstacle_points):
+        """
+        Combine attractive and repulsive forces to get drone velocity.
+
+        Returns a velocity vector (not yet scaled to drone speed).
+        The caller applies the speed scaling.
+        """
+        f_att = self.attractive_force(drone_pos, goal_pos)
+        f_rep = self.repulsive_force(drone_pos, obstacle_points)
+        f_net = f_att + f_rep
+
+        # Normalize to unit vector, then scale by drone speed
+        magnitude = np.linalg.norm(f_net)
+        if magnitude < 1e-6:
+            return np.zeros(2)  # No force — drone is perfectly balanced (stuck!)
+
+        return (f_net / magnitude) * DRONE_SPEED
+
+# =============================================================================
+# A* PATHFINDING (fallback for when APF gets stuck)
+# =============================================================================
+
+class AStarPlanner:
+    """
+    A* grid-based pathfinding algorithm.
+
+    Used as a fallback when APF gets stuck in a local minimum.
+
+    HOW A* WORKS:
+      1. Start at the drone's current position (converted to grid cell)
+      2. Maintain a priority queue of cells to explore
+      3. Priority = g(n) + h(n) where:
+           g(n) = actual cost to reach cell n from start
+           h(n) = estimated cost from n to goal (heuristic)
+      4. Always expand the cell with the lowest priority first
+      5. When we reach the goal cell, trace back the path
+
+    The heuristic h(n) is the straight-line (Euclidean) distance to goal.
+    This is "admissible" — it never overestimates — so A* is guaranteed
+    to find the optimal path.
+
+    Alternatives to A*:
+      - Dijkstra: same as A* but h(n)=0, explores more cells, slower
+      - RRT: random trees, better for high-dimensional spaces
+      - D* Lite: dynamic A* that re-plans efficiently when map changes
+      - Theta*: any-angle paths, smoother than grid A*
+    """
+
+    def __init__(self, occ_grid):
+        self.grid = occ_grid
+
+    def heuristic(self, a, b):
+        """
+        Euclidean distance heuristic.
+        h(n) = straight-line distance from cell a to cell b.
+        """
+        return np.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2)
+
+    def plan(self, start_world, goal_world):
+        """
+        Find a path from start_world to goal_world on the occupancy grid.
+
+        Returns a list of world-coordinate waypoints, or empty list if no path.
+        """
+        # Convert world positions to grid indices
+        start = self.grid.world_to_grid(*start_world)
+        goal  = self.grid.world_to_grid(*goal_world)
+
+        # Priority queue entries: (f_score, (row, col))
+        # heapq gives us the SMALLEST element first (min-heap)
+        open_set = []
+        heapq.heappush(open_set, (0.0, start))
+
+        # came_from[cell] = the cell we came from to reach 'cell'
+        # Used to reconstruct the path at the end
+        came_from = {}
+
+        # g_score[cell] = cost to reach 'cell' from start
+        g_score = defaultdict(lambda: float('inf'))
+        g_score[start] = 0.0
+
+        # f_score[cell] = g_score + heuristic (estimated total cost)
+        f_score = defaultdict(lambda: float('inf'))
+        f_score[start] = self.heuristic(start, goal)
+
+        visited = set()
+
+        # 8-connected grid: can move in 8 directions
+        neighbors_offsets = [
+            (-1,-1), (-1,0), (-1,1),
+            ( 0,-1),          ( 0,1),
+            ( 1,-1), ( 1,0), ( 1,1)
+        ]
+
+        while open_set:
+            _, current = heapq.heappop(open_set)
+
+            if current in visited:
+                continue
+            visited.add(current)
+
+            # Goal reached!
+            if current == goal:
+                return self._reconstruct_path(came_from, current)
+
+            # Explore neighbors
+            for dr, dc in neighbors_offsets:
+                neighbor = (current[0]+dr, current[1]+dc)
+
+                # Skip out-of-bounds cells
+                if not (0 <= neighbor[0] < self.grid.rows and
+                        0 <= neighbor[1] < self.grid.cols):
+                    continue
+
+                # Skip occupied cells (+ safety margin)
+                if self._is_blocked(neighbor):
+                    continue
+
+                # Diagonal moves cost sqrt(2), straight moves cost 1
+                move_cost = np.sqrt(dr**2 + dc**2)
+                tentative_g = g_score[current] + move_cost
+
+                if tentative_g < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor]   = tentative_g
+                    f_score[neighbor]   = tentative_g + self.heuristic(neighbor, goal)
+                    heapq.heappush(open_set, (f_score[neighbor], neighbor))
+
+        # No path found
+        return []
+
+    def _is_blocked(self, cell):
+        """
+        Check if a grid cell is blocked (occupied or too close to an obstacle).
+        We inflate obstacles by DRONE_RADIUS to add a safety margin.
+        This is called "configuration space" inflation in robotics.
+        """
+        margin = int(DRONE_RADIUS / GRID_RES) + 1
+        row, col = cell
+        for dr in range(-margin, margin+1):
+            for dc in range(-margin, margin+1):
+                r, c = row+dr, col+dc
+                if 0 <= r < self.grid.rows and 0 <= c < self.grid.cols:
+                    if self.grid.grid[r, c] == 1:
+                        return True
+        return False
+
+    def _reconstruct_path(self, came_from, current):
+        """
+        Trace back through came_from to reconstruct the full path.
+        Returns a list of world-coordinate positions.
+        """
+        path_cells = []
+        while current in came_from:
+            path_cells.append(current)
+            current = came_from[current]
+        path_cells.reverse()
+
+        # Convert grid cells to world coordinates
+        return [self.grid.grid_to_world(r, c) for r, c in path_cells]
+
+# =============================================================================
+# STUCK DETECTOR
+# =============================================================================
+
+class StuckDetector:
+    """
+    Detects when the drone is stuck in a local minimum.
+
+    Strategy: keep a rolling window of the last N positions.
+    If the drone has moved less than STUCK_THRESHOLD total distance
+    in the last N steps, it's considered stuck.
+
+    This is a simple but effective heuristic used in many real systems.
+    """
+
+    def __init__(self, window=STUCK_WINDOW, threshold=STUCK_THRESHOLD):
+        self.window    = window
+        self.threshold = threshold
+        self.history   = []  # list of recent positions
+
+    def update(self, pos):
+        """Add current position to history, keep only last 'window' entries."""
+        self.history.append(pos.copy())
+        if len(self.history) > self.window:
+            self.history.pop(0)
+
+    def is_stuck(self):
+        """Return True if the drone hasn't moved much recently."""
+        if len(self.history) < self.window:
+            return False  # Not enough data yet
+        # Total distance moved in the window
+        total_movement = sum(
+            np.linalg.norm(self.history[i+1] - self.history[i])
+            for i in range(len(self.history)-1)
+        )
+        return total_movement < self.threshold
+
+    def reset(self):
+        """Clear history after escaping a stuck situation."""
+        self.history = []
+
+# =============================================================================
+# MAIN DRONE SIMULATION
+# =============================================================================
+
+class DroneSimulation:
+    """
+    The main simulation class that ties everything together.
+
+    Each simulation step:
+      1. Scan with LiDAR
+      2. Update occupancy grid
+      3. Check if stuck → if yes, use A*, else use APF
+      4. Move the drone
+      5. Record position for trajectory display
+    """
+
+    def __init__(self):
+        np.random.seed(RANDOM_SEED)
+
+        # Drone state
+        self.pos      = START.copy()
+        self.velocity = np.zeros(2)
+        self.path     = [self.pos.copy()]  # trajectory history
+
+        # World objects
+        self.obstacles = create_obstacles()
+        self.occ_grid  = OccupancyGrid(WORLD_W, WORLD_H, GRID_RES)
+
+        # Navigation components
+        self.lidar    = LiDAR(LIDAR_RANGE, LIDAR_RAYS)
+        self.apf      = APF(K_ATT, K_REP, REP_RANGE)
+        self.stuck    = StuckDetector()
+        self.astar    = AStarPlanner(self.occ_grid)
+
+        # A* waypoint following state
+        self.astar_waypoints  = []   # list of waypoints to follow
+        self.astar_step_count = 0    # how many A* steps taken
+        self.using_astar      = False
+
+        # Statistics
+        self.step_count = 0
+        self.goal_reached = False
+        self.start_time   = time.time()
+
+        # LiDAR visualization data (updated each step)
+        self.lidar_hits = np.zeros((LIDAR_RAYS, 2))
+
+    def step(self):
+        """
+        Perform one simulation step.
+
+        Returns True if goal is reached, False otherwise.
+        """
+        if self.goal_reached:
+            return True
+
+        self.step_count += 1
+
+        # ----------------------------------------------------------------
+        # STEP 1: LiDAR scan — discover the environment
+        # ----------------------------------------------------------------
+        distances, hit_points = self.lidar.scan(self.pos, self.obstacles)
+        self.lidar_hits = hit_points
+
+        # ----------------------------------------------------------------
+        # STEP 2: Update occupancy grid with scan results
+        # ----------------------------------------------------------------
+        self.lidar.update_map(self.pos, distances, hit_points, self.occ_grid)
+
+        # ----------------------------------------------------------------
+        # STEP 3: Update stuck detector
+        # ----------------------------------------------------------------
+        self.stuck.update(self.pos)
+
+        # ----------------------------------------------------------------
+        # STEP 4: Navigation decision — APF or A*?
+        # ----------------------------------------------------------------
+
+        if self.using_astar:
+            # --- Following A* waypoints ---
+            self.astar_step_count += 1
+
+            if self.astar_step_count > STUCK_ESCAPE_STEPS or not self.astar_waypoints:
+                # Done with A* escape — switch back to APF
+                self.using_astar = False
+                self.stuck.reset()
+                print(f"  [Step {self.step_count}] Resumed APF navigation")
+            else:
+                # Move toward the next A* waypoint
+                target = self.astar_waypoints[0]
+                diff   = target - self.pos
+                dist   = np.linalg.norm(diff)
+
+                if dist < GRID_RES * 2:
+                    # Reached this waypoint, move to next
+                    self.astar_waypoints.pop(0)
+                else:
+                    self.velocity = (diff / dist) * DRONE_SPEED
+
+        if not self.using_astar:
+            # --- APF navigation ---
+            obs_pts  = self.occ_grid.get_obstacle_points(self.pos, REP_RANGE)
+            self.velocity = self.apf.compute_velocity(self.pos, GOAL, obs_pts)
+
+            # Check if stuck → trigger A* escape
+            if self.stuck.is_stuck():
+                print(f"  [Step {self.step_count}] STUCK detected! Running A* escape...")
+                waypoints = self.astar.plan(self.pos, GOAL)
+                if waypoints:
+                    # Take only the next portion of the A* path
+                    self.astar_waypoints  = waypoints[:STUCK_ESCAPE_STEPS]
+                    self.astar_step_count = 0
+                    self.using_astar      = True
+                    print(f"  [Step {self.step_count}] A* found {len(waypoints)} waypoints")
+                else:
+                    print(f"  [Step {self.step_count}] A* found no path! Continuing APF...")
+                    self.stuck.reset()
+
+        # ----------------------------------------------------------------
+        # STEP 5: Move the drone
+        # ----------------------------------------------------------------
+        new_pos = self.pos + self.velocity * DT
+
+        # Boundary check — keep drone inside the world
+        new_pos[0] = np.clip(new_pos[0], 0, WORLD_W)
+        new_pos[1] = np.clip(new_pos[1], 0, WORLD_H)
+
+        self.pos = new_pos
+        self.path.append(self.pos.copy())
+
+        # ----------------------------------------------------------------
+        # STEP 6: Check if goal is reached
+        # ----------------------------------------------------------------
+        dist_to_goal = np.linalg.norm(self.pos - GOAL)
+        if dist_to_goal < GOAL_RADIUS:
+            self.goal_reached = True
+            elapsed = time.time() - self.start_time
+            print(f"\n✓ GOAL REACHED in {self.step_count} steps ({elapsed:.1f}s)")
+            return True
+
+        return False
+
+    def compute_trajectory_smoothness(self):
+        """
+        Compute a smoothness score for the trajectory.
+
+        Smoothness = average angle change at each waypoint.
+        Lower = smoother trajectory.
+        A perfectly straight path would score 0.
+        """
+        if len(self.path) < 3:
+            return 0.0
+
+        angles = []
+        for i in range(1, len(self.path)-1):
+            v1 = self.path[i]   - self.path[i-1]
+            v2 = self.path[i+1] - self.path[i]
+            n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+            if n1 < 1e-6 or n2 < 1e-6:
+                continue
+            cos_angle = np.clip(np.dot(v1, v2) / (n1 * n2), -1, 1)
+            angles.append(np.degrees(np.arccos(cos_angle)))
+
+        return np.mean(angles) if angles else 0.0
+
+# =============================================================================
+# VISUALIZATION
+# =============================================================================
+
+def run_simulation_with_animation():
+    """
+    Run the simulation and display an animated 2D top-down view.
+
+    The animation shows:
+      - Grey polygons: obstacles (as seen from above)
+      - Colored grid cells: the occupancy map being built in real-time
+      - Blue lines: current LiDAR scan rays
+      - Red dots at ray ends: LiDAR hit points
+      - Yellow line: drone trajectory so far
+      - Green circle with dot: drone current position
+      - Red star: goal
+    """
+    sim = DroneSimulation()
+
+    # Set up the matplotlib figure
+    fig, (ax_main, ax_info) = plt.subplots(1, 2, figsize=(16, 8),
+                                            gridspec_kw={'width_ratios': [3, 1]})
+    fig.patch.set_facecolor('#1a1a2e')
+    ax_main.set_facecolor('#16213e')
+    ax_info.set_facecolor('#1a1a2e')
+
+    ax_main.set_xlim(0, WORLD_W)
+    ax_main.set_ylim(0, WORLD_H)
+    ax_main.set_aspect('equal')
+    ax_main.set_title('Drone Detect & Avoid Simulation\n(APF + A* Hybrid)',
+                       color='white', fontsize=13)
+    ax_main.tick_params(colors='white')
+    for spine in ax_main.spines.values():
+        spine.set_edgecolor('#334155')
+
+    # Draw true obstacle polygons (light grey — drone doesn't "know" these)
+    for obs in sim.obstacles:
+        poly = plt.Polygon(obs, closed=True, facecolor='#374151',
+                           edgecolor='#6b7280', linewidth=1.5, alpha=0.7, zorder=2)
+        ax_main.add_patch(poly)
+
+    # Draw goal
+    ax_main.plot(*GOAL, 'r*', markersize=18, zorder=10, label='Goal')
+    ax_main.plot(*START, 'go', markersize=10, zorder=10, label='Start')
+
+    # Draw grid lines (subtle)
+    for x in range(0, WORLD_W+1, 10):
+        ax_main.axvline(x, color='#1e3a5f', linewidth=0.3, alpha=0.5)
+    for y in range(0, WORLD_H+1, 10):
+        ax_main.axhline(y, color='#1e3a5f', linewidth=0.3, alpha=0.5)
+
+    # Animated elements (will be updated each frame)
+    traj_line,  = ax_main.plot([], [], '-', color='#fbbf24', linewidth=1.5,
+                                alpha=0.8, zorder=5, label='Trajectory')
+    drone_dot,  = ax_main.plot([], [], 'o', color='#34d399', markersize=10,
+                                zorder=8)
+    drone_circle = plt.Circle((0,0), DRONE_RADIUS, fill=False,
+                               edgecolor='#34d399', linewidth=1.5,
+                               linestyle='--', zorder=7, alpha=0.6)
+    ax_main.add_patch(drone_circle)
+
+    # LiDAR rays (we'll draw them as line collections)
+    lidar_lines = [ax_main.plot([], [], '-', color='#3b82f6', linewidth=0.4,
+                                alpha=0.3, zorder=4)[0]
+                   for _ in range(LIDAR_RAYS)]
+    lidar_hits_scatter = ax_main.scatter([], [], s=4, c='#ef4444', zorder=6,
+                                          alpha=0.7)
+
+    # Occupancy grid display (image)
+    occ_img = ax_main.imshow(
+        np.zeros((sim.occ_grid.rows, sim.occ_grid.cols)),
+        origin='lower', extent=[0, WORLD_W, 0, WORLD_H],
+        cmap='Blues', vmin=0, vmax=1, alpha=0.4, zorder=3
+    )
+
+    # A* waypoint indicator
+    astar_scatter = ax_main.scatter([], [], s=15, c='#a855f7',
+                                     marker='x', zorder=9, alpha=0.7)
+
+    # Info panel
+    ax_info.set_xlim(0, 1)
+    ax_info.set_ylim(0, 1)
+    ax_info.axis('off')
+    info_text = ax_info.text(0.05, 0.95, '', transform=ax_info.transAxes,
+                              color='white', fontsize=10, verticalalignment='top',
+                              fontfamily='monospace',
+                              bbox=dict(boxstyle='round', facecolor='#0f172a',
+                                        alpha=0.8, edgecolor='#334155'))
+
+    ax_main.legend(loc='upper right', facecolor='#0f172a',
+                   labelcolor='white', fontsize=9)
+
+    def update(frame):
+        # Run several simulation steps per animation frame (for speed)
+        steps_per_frame = 3
+        for _ in range(steps_per_frame):
+            if not sim.goal_reached:
+                sim.step()
+
+        # Update trajectory
+        if len(sim.path) > 1:
+            path_arr = np.array(sim.path)
+            traj_line.set_data(path_arr[:, 0], path_arr[:, 1])
+
+        # Update drone position
+        drone_dot.set_data([sim.pos[0]], [sim.pos[1]])
+        drone_circle.center = sim.pos
+
+        # Update LiDAR rays
+        for i in range(LIDAR_RAYS):
+            lidar_lines[i].set_data(
+                [sim.pos[0], sim.lidar_hits[i, 0]],
+                [sim.pos[1], sim.lidar_hits[i, 1]]
+            )
+
+        # Update LiDAR hit points
+        hit_arr = sim.lidar_hits
+        lidar_hits_scatter.set_offsets(hit_arr)
+
+        # Update occupancy grid display
+        occ_img.set_data(sim.occ_grid.grid)
+
+        # Update A* waypoints display
+        if sim.astar_waypoints:
+            wp_arr = np.array(sim.astar_waypoints)
+            astar_scatter.set_offsets(wp_arr)
+        else:
+            astar_scatter.set_offsets(np.empty((0, 2)))
+
+        # Update info panel
+        dist_to_goal = np.linalg.norm(sim.pos - GOAL)
+        mode = "A* ESCAPE" if sim.using_astar else "APF NAV"
+        smoothness   = sim.compute_trajectory_smoothness()
+        elapsed      = time.time() - sim.start_time
+
+        status = "✓ REACHED!" if sim.goal_reached else "Flying..."
+        info = (
+            f"STATUS: {status}\n"
+            f"Mode:   {mode}\n"
+            f"─────────────────\n"
+            f"Step:   {sim.step_count}/{MAX_STEPS}\n"
+            f"Time:   {elapsed:.1f}s\n"
+            f"─────────────────\n"
+            f"Position:\n"
+            f"  X = {sim.pos[0]:.1f}m\n"
+            f"  Y = {sim.pos[1]:.1f}m\n"
+            f"─────────────────\n"
+            f"Dist to goal:\n"
+            f"  {dist_to_goal:.1f}m\n"
+            f"─────────────────\n"
+            f"Traj. smoothness:\n"
+            f"  {smoothness:.2f}°/step\n"
+            f"  (lower = smoother)\n"
+            f"─────────────────\n"
+            f"Map cells filled:\n"
+            f"  {np.sum(sim.occ_grid.grid)}\n"
+        )
+        info_text.set_text(info)
+
+        # Stop animation when done
+        if sim.goal_reached or sim.step_count >= MAX_STEPS:
+            ani.event_source.stop()
+            if not sim.goal_reached:
+                print(f"\n✗ MAX STEPS reached without reaching goal.")
+                ax_main.set_title('FAILED — max steps reached', color='#ef4444')
+            else:
+                ax_main.set_title(
+                    f'✓ Goal Reached! Steps: {sim.step_count}  '
+                    f'Smoothness: {smoothness:.2f}°',
+                    color='#34d399', fontsize=12)
+
+        return (traj_line, drone_dot, drone_circle, occ_img,
+                *lidar_lines, lidar_hits_scatter, astar_scatter, info_text)
+
+    print("=" * 60)
+    print("  DRONE DETECT & AVOID SIMULATION")
+    print("  Algorithm: APF + A* Hybrid")
+    print(f"  Start: {START}  Goal: {GOAL}")
+    print("=" * 60)
+    print("Starting simulation...")
+    print("(Close the window to end)\n")
+
+    ani = FuncAnimation(fig, update, frames=MAX_STEPS // 3,
+                        interval=30, blit=False, repeat=False)
+
+    plt.tight_layout()
+    plt.show()
+
+    # Final statistics
+    print("\n" + "=" * 60)
+    print("  FINAL STATISTICS")
+    print("=" * 60)
+    print(f"  Goal reached:     {'Yes' if sim.goal_reached else 'No'}")
+    print(f"  Total steps:      {sim.step_count}")
+    print(f"  Elapsed time:     {time.time()-sim.start_time:.1f}s")
+    print(f"  Traj. smoothness: {sim.compute_trajectory_smoothness():.2f}°/step")
+    print(f"  Map cells built:  {np.sum(sim.occ_grid.grid)}")
+    print("=" * 60)
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
+if __name__ == "__main__":
+    run_simulation_with_animation()
