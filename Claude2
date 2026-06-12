@@ -1,0 +1,791 @@
+# =============================================================================
+#  DETECT AND AVOID SERVER — ROS2 / UAS Tutorial Format
+#  Algorithm : Artificial Potential Field (APF) + A* grid fallback
+#  Sensor    : 2D LiDAR (sensor_msgs/LaserScan)
+# =============================================================================
+#
+#  HOW THIS FILE FITS INTO THE SYSTEM
+#  ────────────────────────────────────
+#  ROS2 is a robotics middleware that connects hardware and software.
+#  Think of it like a postal system — different parts of the drone
+#  (flight controller, LiDAR, your code) communicate by sending
+#  "messages" through "topics".
+#
+#  This class does three things:
+#    1.  LISTENS to the LiDAR topic   →  on_scan() is called automatically
+#        every time a new scan arrives (typically 10-40 times per second).
+#
+#    2.  EXECUTES the mission          →  execute() runs the navigation loop.
+#        It reads LiDAR data, computes forces, and sends position setpoints
+#        to the flight controller via update_goto_setpoint().
+#
+#    3.  CHECKS completion             →  is_position_reached() is provided
+#        by the base class and returns True when the drone is close enough
+#        to the commanded position.
+#
+#  BASE CLASS GIFTS (provided by _DetectAndAvoidServer):
+#    self.local_position              → current drone x, y, z in metres
+#    self.vehicle_status              → flight mode, arm status, timestamp
+#    self.update_goto_setpoint(x,y,z) → send a "fly to this point" command
+#    self.is_position_reached(x,y,z)  → True if drone is close to that point
+#    self.get_logger()                → ROS2 logger (prints to console)
+#
+#  LASERSCAN MESSAGE STRUCTURE (sensor_msgs/LaserScan):
+#    msg.ranges       → list of distances [metres] — one per ray
+#    msg.angle_min    → start angle [radians]
+#    msg.angle_max    → end angle [radians]
+#    msg.angle_increment → angular step between rays [radians]
+#    msg.range_min    → minimum valid range
+#    msg.range_max    → maximum valid range
+#    msg.header.stamp → timestamp of the scan
+#
+# =============================================================================
+
+import math
+import heapq                            # For A* priority queue (min-heap)
+from time import sleep
+from collections import defaultdict
+
+import numpy as np                      # Numerical arrays and maths
+
+from rclpy.action.server import ServerGoalHandle
+from rclpy.logging import LoggingSeverity
+from sensor_msgs.msg import LaserScan
+from uas_tutorial.action import DetectAndAvoid
+from uas_tutorial_py._core.detect_and_avoid import _DetectAndAvoidServer
+
+
+# =============================================================================
+#  TUNING PARAMETERS — change these to adjust drone behaviour
+# =============================================================================
+
+# ── APF (Artificial Potential Field) ────────────────────────────────────────
+K_ATT          = 1.2    # Attractive gain: how strongly the goal pulls the drone.
+                        # Larger = rushes toward goal, may overshoot.
+
+K_REP          = 60.0   # Repulsive gain: how hard obstacles push the drone away.
+                        # Larger = gives obstacles more personal space.
+
+REP_RANGE      = 4.0    # Metres. Obstacles farther than this are ignored.
+                        # Think of it as the "danger bubble" radius.
+
+DRONE_SPEED    = 0.6    # Metres per step. How far each setpoint is placed.
+                        # Smaller = smoother path but slower mission.
+
+# ── Occupancy grid ──────────────────────────────────────────────────────────
+GRID_RES       = 0.4    # Metres per grid cell. Smaller = more precise map
+                        # but uses more memory. 0.4m is a good balance.
+
+WORLD_SIZE     = 120.0  # Metres. Assumed square world. Make ≥ your flight area.
+
+# ── Safety margins ──────────────────────────────────────────────────────────
+DRONE_RADIUS   = 1.2    # Metres. Physical + safety radius used to inflate
+                        # obstacles on the A* grid (configuration space).
+
+GOAL_TOLERANCE = 1.5    # Metres. How close = "mission complete".
+
+# ── Stuck detection ──────────────────────────────────────────────────────────
+STUCK_WINDOW   = 25     # Number of control steps in the detection window.
+STUCK_DIST     = 0.4    # Metres. If total movement in window < this → stuck.
+
+# ── A* escape behaviour ──────────────────────────────────────────────────────
+ASTAR_STEP_LIMIT  = 50  # Max steps following an A* path before re-enabling APF.
+WAYPOINT_REACH_D  = 0.8 # Metres. How close to a waypoint before moving to next.
+
+# ── Control loop ─────────────────────────────────────────────────────────────
+CONTROL_RATE   = 0.1    # Seconds between control iterations (10 Hz).
+
+
+# =============================================================================
+#  OCCUPANCY GRID
+# =============================================================================
+#
+#  What is an occupancy grid?
+#  ──────────────────────────
+#  Imagine a piece of graph paper laid over the world from above.
+#  Each square on the paper is a "cell".
+#  When the LiDAR detects an obstacle in a region, we colour that
+#  cell grey (occupied = 1).  Empty cells stay white (free = 0).
+#
+#  This gives the drone a growing map of the environment that
+#  starts completely blank and fills in as it flies.
+#
+#  Why not just use raw LiDAR ranges?
+#  ───────────────────────────────────
+#  Raw ranges are great for APF (we use them directly there).
+#  But A* needs a discrete map to search through — you can't run
+#  graph search on a continuous field.  The grid is that map.
+
+class OccupancyGrid:
+    def __init__(self, world_size: float, res: float):
+        self.res   = res
+        self.size  = int(world_size / res) + 2
+        # All cells start as free (0 = unknown/free, 1 = occupied)
+        self.grid  = np.zeros((self.size, self.size), dtype=np.uint8)
+
+    def _to_cell(self, x: float, y: float):
+        """
+        Convert a real-world (x, y) coordinate in metres to (row, col).
+
+        We add a half-world offset so the drone can fly in negative
+        coordinates too (e.g. it starts at 0,0 and the grid extends
+        WORLD_SIZE/2 in each direction from origin).
+        """
+        offset = self.size // 2
+        col    = int(x / self.res) + offset
+        row    = int(y / self.res) + offset
+        col    = max(0, min(self.size - 1, col))
+        row    = max(0, min(self.size - 1, row))
+        return row, col
+
+    def _to_world(self, row: int, col: int):
+        """Convert (row, col) grid indices back to world (x, y) in metres."""
+        offset = self.size // 2
+        x = (col - offset + 0.5) * self.res
+        y = (row - offset + 0.5) * self.res
+        return x, y
+
+    def mark_occupied(self, x: float, y: float):
+        """Mark the cell at world position (x,y) as occupied."""
+        r, c = self._to_cell(x, y)
+        self.grid[r, c] = 1
+
+    def is_blocked(self, row: int, col: int, margin_cells: int = 0) -> bool:
+        """
+        Check if (row, col) is occupied, including a safety margin.
+
+        margin_cells: extra cells to check around the target cell.
+        This "inflates" obstacles so the drone keeps safe distance.
+        In robotics this is called C-space (configuration space) inflation.
+        """
+        for dr in range(-margin_cells, margin_cells + 1):
+            for dc in range(-margin_cells, margin_cells + 1):
+                r, c = row + dr, col + dc
+                if 0 <= r < self.size and 0 <= c < self.size:
+                    if self.grid[r, c] == 1:
+                        return True
+        return False
+
+    def get_nearby_obstacle_positions(self, x: float, y: float, radius: float):
+        """
+        Return world (x, y) centres of all occupied cells within 'radius' metres.
+
+        Used by APF to find which obstacles to repel from.
+        Searching only a local area is much faster than scanning the whole grid.
+        """
+        r_cells = int(radius / self.res) + 1
+        cr, cc  = self._to_cell(x, y)
+        result  = []
+        for dr in range(-r_cells, r_cells + 1):
+            for dc in range(-r_cells, r_cells + 1):
+                rr, rc = cr + dr, cc + dc
+                if 0 <= rr < self.size and 0 <= rc < self.size:
+                    if self.grid[rr, rc] == 1:
+                        wx, wy = self._to_world(rr, rc)
+                        dist   = math.hypot(wx - x, wy - y)
+                        if dist <= radius:
+                            result.append((wx, wy))
+        return result
+
+
+# =============================================================================
+#  APF — ARTIFICIAL POTENTIAL FIELD
+# =============================================================================
+#
+#  Mental model:
+#  ─────────────
+#  Imagine the goal position is a valley in a landscape.
+#  Every obstacle is a hill.
+#  The drone is a ball rolling downhill — it naturally flows
+#  toward the valley while being deflected around the hills.
+#
+#  The "slope" at any point is the gradient of the combined
+#  potential field.  We compute this gradient directly from the
+#  known goal position and the LiDAR-detected obstacle positions.
+#
+#  Attractive potential (U_att):
+#    U_att = 0.5 * K_ATT * distance_to_goal²
+#    F_att = K_ATT * (goal - drone)    ← points toward goal
+#
+#  Repulsive potential (U_rep) for each obstacle within REP_RANGE:
+#    d    = distance to obstacle
+#    eta  = (1/d − 1/REP_RANGE)
+#    U_rep = 0.5 * K_REP * eta²
+#    F_rep = K_REP * eta * (1/d²) * unit_vector_away_from_obstacle
+#
+#  Net force = F_att + ΣF_rep
+#  Velocity   = normalise(net_force) * DRONE_SPEED
+
+def apf_compute_velocity(
+    drone_x: float, drone_y: float,
+    goal_x: float,  goal_y: float,
+    obstacle_positions: list,
+    k_att: float, k_rep: float, rep_range: float, speed: float
+):
+    """
+    Compute the APF velocity vector for the drone.
+
+    Returns (vx, vy) — a velocity vector already scaled to 'speed'.
+    Returns (0, 0) if forces perfectly cancel (stuck in local minimum).
+    """
+    # ── Attractive force ──────────────────────────────────────────────────
+    # Direction from drone to goal.  Magnitude grows with distance.
+    dx_goal = goal_x - drone_x
+    dy_goal = goal_y - drone_y
+    fx_att  = k_att * dx_goal
+    fy_att  = k_att * dy_goal
+
+    # ── Repulsive forces (sum over all nearby obstacle cells) ─────────────
+    fx_rep = 0.0
+    fy_rep = 0.0
+    for (ox, oy) in obstacle_positions:
+        dx  = drone_x - ox
+        dy  = drone_y - oy
+        d   = math.hypot(dx, dy)
+        if d < 0.05:
+            d = 0.05          # avoid division by zero
+
+        if d < rep_range:
+            # eta is the "severity" term — large when close, zero at boundary
+            eta       = (1.0 / d) - (1.0 / rep_range)
+            magnitude = k_rep * eta * (1.0 / d ** 2)
+            # Push directly away from obstacle
+            fx_rep   += magnitude * (dx / d)
+            fy_rep   += magnitude * (dy / d)
+
+    # ── Combine ───────────────────────────────────────────────────────────
+    fx_net = fx_att + fx_rep
+    fy_net = fy_att + fy_rep
+    mag    = math.hypot(fx_net, fy_net)
+
+    if mag < 1e-6:
+        return 0.0, 0.0       # Zero net force → stuck
+
+    # Scale to the desired drone speed
+    return (fx_net / mag) * speed, (fy_net / mag) * speed
+
+
+# =============================================================================
+#  A* PATHFINDER
+# =============================================================================
+#
+#  When does A* get called?
+#  ────────────────────────
+#  APF can get "stuck" in a local minimum — a point where the attractive
+#  and repulsive forces perfectly cancel and the drone stops moving.
+#  Classic example: a U-shaped obstacle opening away from the goal.
+#
+#  A* escapes this by searching the occupancy grid for a route.
+#  It's guaranteed to find a path if one exists (it explores all
+#  reachable cells and picks the optimal one).
+#
+#  How A* works (plain English):
+#  ──────────────────────────────
+#  1. Start at drone's current grid cell.
+#  2. Maintain a "to-explore" list, sorted by estimated total cost:
+#       f(n) = g(n) + h(n)
+#       g(n) = actual cost from start to cell n
+#       h(n) = straight-line distance from n to goal (heuristic)
+#  3. Always expand the cell with the lowest f(n) first.
+#  4. When we reach the goal cell, trace back the path via came_from[].
+#
+#  Why is h(n) = straight-line distance?
+#  ────────────────────────────────────────
+#  It never over-estimates the true cost, so A* is guaranteed optimal.
+#  This property is called "admissibility".
+
+def astar_plan(
+    occ_grid: OccupancyGrid,
+    start_x: float, start_y: float,
+    goal_x: float,  goal_y: float,
+    safety_margin: int
+):
+    """
+    Run A* on the occupancy grid from (start_x, start_y) to (goal_x, goal_y).
+
+    safety_margin: number of extra cells around occupied cells to treat
+                   as blocked.  Derived from DRONE_RADIUS / GRID_RES.
+
+    Returns a list of (x, y) world-coordinate waypoints, or [] if no path.
+    """
+    start_cell = occ_grid._to_cell(start_x, start_y)
+    goal_cell  = occ_grid._to_cell(goal_x,  goal_y)
+
+    # Priority queue: (f_score, (row, col))
+    open_heap = []
+    heapq.heappush(open_heap, (0.0, start_cell))
+
+    came_from  = {}                           # cell → parent cell
+    g_score    = defaultdict(lambda: math.inf)
+    g_score[start_cell] = 0.0
+
+    visited = set()
+
+    # 8-directional movement (including diagonals)
+    moves = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+
+    while open_heap:
+        _, current = heapq.heappop(open_heap)
+
+        if current in visited:
+            continue
+        visited.add(current)
+
+        # ── Goal reached — reconstruct path ───────────────────────────────
+        if current == goal_cell:
+            path_cells = []
+            node = current
+            while node in came_from:
+                path_cells.append(node)
+                node = came_from[node]
+            path_cells.reverse()
+            # Convert cells to world coordinates
+            return [occ_grid._to_world(r, c) for (r, c) in path_cells]
+
+        # ── Expand neighbours ─────────────────────────────────────────────
+        cr, cc = current
+        for dr, dc in moves:
+            nr, nc   = cr + dr, cc + dc
+            neighbour = (nr, nc)
+
+            if not (0 <= nr < occ_grid.size and 0 <= nc < occ_grid.size):
+                continue                          # out of bounds
+
+            if occ_grid.is_blocked(nr, nc, safety_margin):
+                continue                          # obstacle or too close
+
+            # Diagonal moves cost sqrt(2) ≈ 1.414; cardinal moves cost 1
+            step_cost    = math.sqrt(dr * dr + dc * dc)
+            new_g        = g_score[current] + step_cost
+
+            if new_g < g_score[neighbour]:
+                came_from[neighbour] = current
+                g_score[neighbour]   = new_g
+                # Heuristic: straight-line distance to goal in cell units
+                h = math.hypot(nr - goal_cell[0], nc - goal_cell[1])
+                f = new_g + h
+                heapq.heappush(open_heap, (f, neighbour))
+
+    return []   # No path found
+
+
+# =============================================================================
+#  STUCK DETECTOR
+# =============================================================================
+#
+#  The drone is "stuck" if it barely moves despite having a velocity command.
+#  We track recent positions and compare total movement over a sliding window.
+#
+#  This is simpler but very effective for detecting local minima.
+
+class StuckDetector:
+    def __init__(self, window: int = STUCK_WINDOW, threshold: float = STUCK_DIST):
+        self.window    = window
+        self.threshold = threshold
+        self.history   = []   # list of (x, y) tuples
+
+    def update(self, x: float, y: float):
+        self.history.append((x, y))
+        if len(self.history) > self.window:
+            self.history.pop(0)
+
+    def is_stuck(self) -> bool:
+        """Return True if total movement in recent history is below threshold."""
+        if len(self.history) < self.window:
+            return False
+        total = sum(
+            math.hypot(self.history[i+1][0] - self.history[i][0],
+                       self.history[i+1][1] - self.history[i][1])
+            for i in range(len(self.history) - 1)
+        )
+        return total < self.threshold
+
+    def reset(self):
+        self.history = []
+
+
+# =============================================================================
+#  LIDAR PROCESSING HELPERS
+# =============================================================================
+#
+#  The LaserScan message gives us a flat list of range values.
+#  We need to convert those ranges into (x, y) obstacle positions
+#  in the world frame so APF and the occupancy grid can use them.
+#
+#  Coordinate convention used here:
+#  ────────────────────────────────
+#  We work in the drone's LOCAL frame (drone is at origin).
+#  angle_min is the angle of the first ray.
+#  Each subsequent ray is angle_min + i * angle_increment.
+#  We then rotate by the drone's current yaw to get world-frame positions.
+#  (For Level 1 a fixed-heading simplification works fine.)
+
+def parse_laserscan(msg: LaserScan, drone_x: float, drone_y: float, drone_yaw: float = 0.0):
+    """
+    Convert a LaserScan message into a list of obstacle world positions.
+
+    Parameters
+    ──────────
+    msg       : LaserScan from the LiDAR topic
+    drone_x/y : current drone world position
+    drone_yaw : drone heading in radians (0 = facing +X axis)
+
+    Returns
+    ───────
+    obstacle_positions : list of (x, y) world coordinates of detected points
+    """
+    obstacle_positions = []
+    angle = msg.angle_min
+
+    for dist in msg.ranges:
+        # Skip invalid readings (inf, nan, out of range)
+        if (math.isfinite(dist)
+                and msg.range_min < dist < msg.range_max):
+            # Local frame: where is this hit point relative to the drone?
+            local_x = dist * math.cos(angle)
+            local_y = dist * math.sin(angle)
+
+            # Rotate by drone yaw to convert to world frame
+            cos_y = math.cos(drone_yaw)
+            sin_y = math.sin(drone_yaw)
+            world_x = drone_x + cos_y * local_x - sin_y * local_y
+            world_y = drone_y + sin_y * local_x + cos_y * local_y
+
+            obstacle_positions.append((world_x, world_y))
+
+        angle += msg.angle_increment
+
+    return obstacle_positions
+
+
+def update_occupancy_grid(occ_grid: OccupancyGrid, obstacle_positions: list):
+    """
+    Mark all detected obstacle positions on the occupancy grid.
+
+    In a more advanced system you would also:
+    - Mark the FREE space along each ray (ray casting / Bresenham's line)
+    - Decay old obstacle beliefs over time (Bayesian occupancy)
+    For Level 1 this simple "mark occupied" approach is sufficient.
+    """
+    for (wx, wy) in obstacle_positions:
+        occ_grid.mark_occupied(wx, wy)
+
+
+# =============================================================================
+#  MAIN SERVER CLASS
+# =============================================================================
+
+class DetectAndAvoidServer(_DetectAndAvoidServer):
+    """
+    ROS2 Action Server that navigates a drone from its current position
+    to a goal using APF for smooth reactive avoidance and A* as a
+    fallback when APF gets stuck in a local minimum.
+
+    ── How the two methods interact ────────────────────────────────────────
+    on_scan()  runs asynchronously on the LiDAR callback thread.
+               It stores the latest scan in self.last_scan.
+
+    execute()  runs on the action executor thread.
+               It reads self.last_scan, computes a setpoint, sends it,
+               and sleeps for CONTROL_RATE seconds, then repeats.
+
+    Because on_scan and execute run on different threads, self.last_scan
+    must be treated as a shared resource.  For Level 1 Python's GIL
+    makes plain assignment safe, but for production code you would use
+    threading.Lock() around access to self.last_scan.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.get_logger().set_level(LoggingSeverity.DEBUG)
+
+        # ── Latest LiDAR scan (updated by on_scan callback) ───────────────
+        self.last_scan: LaserScan = LaserScan()
+
+        # ── Occupancy grid map ────────────────────────────────────────────
+        # Created once at startup.  Persists across the whole mission so
+        # the drone remembers obstacles it has already passed.
+        self.occ_grid = OccupancyGrid(WORLD_SIZE, GRID_RES)
+
+        # ── Stuck detector ────────────────────────────────────────────────
+        self.stuck_detector = StuckDetector(STUCK_WINDOW, STUCK_DIST)
+
+        # ── A* state ──────────────────────────────────────────────────────
+        # When APF gets stuck we switch to A* escape mode.
+        # These variables track the active waypoints and step count.
+        self.astar_waypoints : list  = []   # (x, y) waypoints to follow
+        self.astar_step_count: int   = 0    # steps taken in this escape
+        self.using_astar     : bool  = False
+
+        # ── Safety margin for A* (in grid cells) ─────────────────────────
+        # Inflate obstacles by DRONE_RADIUS so A* keeps the drone clear.
+        self.safety_margin_cells = max(1, int(DRONE_RADIUS / GRID_RES))
+
+        self.get_logger().info(
+            "DetectAndAvoidServer ready — APF + A* hybrid algorithm loaded."
+        )
+
+    # =========================================================================
+    #  LIDAR CALLBACK
+    # =========================================================================
+
+    def on_scan(self, msg: LaserScan):
+        """
+        Called by ROS2 every time the LiDAR publishes a new scan.
+
+        What we do here:
+          1. Store the raw scan (execute() reads it)
+          2. Parse the scan into world-frame obstacle positions
+          3. Update the persistent occupancy grid
+
+        We keep this callback fast (no heavy computation) so we never
+        block the ROS2 executor.  The navigation decisions happen in execute().
+        """
+        self.last_scan = msg
+
+        # Only update the map if we have a valid drone position.
+        # (local_position may not be ready during first few milliseconds)
+        try:
+            pos = self.local_position
+            # Drone yaw (heading) — if available from vehicle_status or odometry.
+            # For Level 1 we assume the drone always faces its direction of travel.
+            # In a real system you would read this from the IMU/attitude topic.
+            drone_yaw = 0.0   # Replace with actual yaw if available
+
+            obs_pts = parse_laserscan(msg, pos.x, pos.y, drone_yaw)
+            update_occupancy_grid(self.occ_grid, obs_pts)
+
+        except Exception as e:
+            # local_position may be None on startup — gracefully ignore
+            self.get_logger().debug(f"on_scan: skipped map update ({e})")
+
+    # =========================================================================
+    #  MISSION EXECUTE LOOP
+    # =========================================================================
+
+    def execute(self, goal_handle: ServerGoalHandle):
+        """
+        Main detect-and-avoid navigation loop.
+
+        This method runs once per action goal request.  It loops at
+        CONTROL_RATE Hz, each iteration:
+          1. Reads the current drone position
+          2. Parses the latest LiDAR scan for local obstacle positions
+          3. Decides: APF mode or A* escape mode?
+          4. Computes the next setpoint (a target position 1 step ahead)
+          5. Sends the setpoint via update_goto_setpoint()
+          6. Checks for goal reached / cancel request
+          7. Sleeps until the next iteration
+
+        The loop exits (and returns a result) when:
+          - The drone reaches the goal position
+          - The action client requests a cancel
+
+        NOTE ON ALTITUDE (Z):
+        ─────────────────────
+        For a 2D horizontal mission we keep the drone at a fixed altitude.
+        The Z setpoint is always the current altitude — the drone only
+        moves in the XY plane.  In a 3D mission you would also compute
+        Z avoidance from a 3D LiDAR or barometric data.
+        """
+        self.get_logger().info("Detect and avoid mission started.")
+
+        # ── Read goal from the action request ─────────────────────────────
+        # The goal contains the target world position the drone must reach.
+        # (The exact field names depend on the DetectAndAvoid.action definition.
+        #  Adjust goal_handle.request.goal_x / goal_y if your action uses
+        #  different field names.)
+        try:
+            goal_x = float(goal_handle.request.goal_x)
+            goal_y = float(goal_handle.request.goal_y)
+        except AttributeError:
+            # Fallback: if the action has no explicit goal position,
+            # use a default 50m ahead along the +Y axis (original template style)
+            self.get_logger().warn(
+                "Goal position not found in request — using default (+50 Y)."
+            )
+            goal_x = self.local_position.x
+            goal_y = self.local_position.y + 50.0
+
+        # Hold current altitude throughout the mission
+        goal_z = self.local_position.z
+        self.get_logger().info(
+            f"Goal: ({goal_x:.1f}, {goal_y:.1f}, {goal_z:.1f})"
+        )
+
+        # ── Reset navigation state for this mission ────────────────────────
+        self.stuck_detector.reset()
+        self.astar_waypoints  = []
+        self.astar_step_count = 0
+        self.using_astar      = False
+
+        # ── Main control loop ──────────────────────────────────────────────
+        step = 0
+        while True:
+            step += 1
+
+            # ── 1. Check for cancellation ──────────────────────────────────
+            if goal_handle.is_cancel_requested:
+                self.get_logger().info("Mission cancelled by client.")
+                goal_handle.canceled()
+                return DetectAndAvoid.Result()
+
+            # ── 2. Read current drone state ────────────────────────────────
+            pos     = self.local_position
+            drone_x = pos.x
+            drone_y = pos.y
+            drone_z = pos.z
+
+            # ── 3. Check goal reached ──────────────────────────────────────
+            dist_to_goal = math.hypot(drone_x - goal_x, drone_y - goal_y)
+            if dist_to_goal < GOAL_TOLERANCE:
+                self.get_logger().info(
+                    f"Goal reached! Final distance: {dist_to_goal:.2f}m  "
+                    f"Steps: {step}"
+                )
+                goal_handle.succeed()
+                return DetectAndAvoid.Result()
+
+            # ── 4. Parse latest LiDAR scan ─────────────────────────────────
+            # Get obstacle positions in LOCAL range (within REP_RANGE only)
+            # so APF doesn't compute forces from distant cells unnecessarily.
+            drone_yaw = 0.0   # Replace with actual IMU yaw for accuracy
+            if self.last_scan.ranges:
+                local_obs = parse_laserscan(
+                    self.last_scan, drone_x, drone_y, drone_yaw
+                )
+                # Filter: only keep obstacles within APF influence range
+                nearby_obs = [
+                    (ox, oy) for (ox, oy) in local_obs
+                    if math.hypot(ox - drone_x, oy - drone_y) <= REP_RANGE
+                ]
+            else:
+                nearby_obs = []
+
+            # ── 5. Update stuck detector ───────────────────────────────────
+            self.stuck_detector.update(drone_x, drone_y)
+
+            # ── 6. Navigation decision: APF or A*? ────────────────────────
+
+            if self.using_astar:
+                # ── A* ESCAPE MODE ────────────────────────────────────────
+                # Follow the pre-planned waypoints one by one.
+                self.astar_step_count += 1
+
+                # Check if we should give APF another chance
+                if self.astar_step_count > ASTAR_STEP_LIMIT or not self.astar_waypoints:
+                    self.get_logger().info(
+                        f"[Step {step}] A* escape complete — resuming APF."
+                    )
+                    self.using_astar = False
+                    self.stuck_detector.reset()
+                    # Fall through to APF on this step
+                else:
+                    # Move toward the first waypoint in the list
+                    wp_x, wp_y    = self.astar_waypoints[0]
+                    dist_to_wp    = math.hypot(wp_x - drone_x, wp_y - drone_y)
+
+                    if dist_to_wp < WAYPOINT_REACH_D:
+                        # Reached this waypoint — move to the next
+                        self.astar_waypoints.pop(0)
+                        if self.astar_waypoints:
+                            wp_x, wp_y = self.astar_waypoints[0]
+                        else:
+                            # All waypoints consumed — back to APF
+                            self.using_astar = False
+                            self.stuck_detector.reset()
+
+                    if self.using_astar and self.astar_waypoints:
+                        # Compute the setpoint: move toward wp at drone speed
+                        wp_x, wp_y = self.astar_waypoints[0]
+                        dx   = wp_x - drone_x
+                        dy   = wp_y - drone_y
+                        dist = math.hypot(dx, dy)
+                        if dist > 1e-6:
+                            # Place setpoint one DRONE_SPEED step toward waypoint
+                            step_x = drone_x + (dx / dist) * DRONE_SPEED
+                            step_y = drone_y + (dy / dist) * DRONE_SPEED
+                        else:
+                            step_x, step_y = wp_x, wp_y
+
+                        self.get_logger().debug(
+                            f"[Step {step}] A* → WP ({wp_x:.1f},{wp_y:.1f})  "
+                            f"Setpoint ({step_x:.1f},{step_y:.1f})"
+                        )
+                        self.update_goto_setpoint(step_x, step_y, goal_z)
+                        sleep(CONTROL_RATE)
+                        continue    # Skip the APF block below
+
+            # ── APF MODE (or just switched back from A*) ──────────────────
+            vx, vy = apf_compute_velocity(
+                drone_x, drone_y,
+                goal_x,  goal_y,
+                nearby_obs,
+                K_ATT, K_REP, REP_RANGE, DRONE_SPEED
+            )
+
+            # Place the next setpoint DRONE_SPEED metres ahead in the APF direction
+            setpoint_x = drone_x + vx
+            setpoint_y = drone_y + vy
+
+            self.get_logger().debug(
+                f"[Step {step}] APF  "
+                f"Pos ({drone_x:.1f},{drone_y:.1f})  "
+                f"Force ({vx:.2f},{vy:.2f})  "
+                f"Dist {dist_to_goal:.1f}m  "
+                f"Obs nearby: {len(nearby_obs)}"
+            )
+
+            # ── 7. Check if stuck → trigger A* escape ─────────────────────
+            if self.stuck_detector.is_stuck():
+                self.get_logger().warn(
+                    f"[Step {step}] STUCK detected! "
+                    f"Triggering A* escape from ({drone_x:.1f},{drone_y:.1f})"
+                )
+                waypoints = astar_plan(
+                    self.occ_grid,
+                    drone_x, drone_y,
+                    goal_x,  goal_y,
+                    self.safety_margin_cells
+                )
+                if waypoints:
+                    # Take only the first ASTAR_STEP_LIMIT waypoints
+                    self.astar_waypoints  = waypoints[:ASTAR_STEP_LIMIT]
+                    self.astar_step_count = 0
+                    self.using_astar      = True
+                    self.get_logger().info(
+                        f"[Step {step}] A* found {len(waypoints)} waypoints. "
+                        f"Following first {len(self.astar_waypoints)}."
+                    )
+                else:
+                    # A* also failed (fully enclosed?) — just keep trying APF
+                    self.get_logger().error(
+                        f"[Step {step}] A* found no path! Continuing APF..."
+                    )
+                    self.stuck_detector.reset()   # reset window to re-check later
+
+            # ── 8. Send setpoint to flight controller ──────────────────────
+            #
+            # update_goto_setpoint(x, y, z) sends a position target to the
+            # PX4/ArduPilot flight controller via MAVROS or micro-ROS.
+            # The FMU's onboard position controller (PID) flies the drone
+            # to that position.  We send a new target every CONTROL_RATE seconds.
+            #
+            # Important: we do NOT wait for the drone to reach the setpoint
+            # before sending the next one.  We send intermediate setpoints
+            # at DRONE_SPEED metre steps, creating a moving target the drone
+            # chases.  This produces smooth, reactive flight.
+            #
+            self.update_goto_setpoint(setpoint_x, setpoint_y, goal_z)
+
+            self.get_logger().info(
+                f"Vehicle time: {self.vehicle_status.timestamp}  "
+                f"Dist to goal: {dist_to_goal:.1f}m"
+            )
+
+            # ── 9. Control loop rate ───────────────────────────────────────
+            # Sleep so we run at approximately 1/CONTROL_RATE Hz.
+            # At 0.1s this is 10 Hz — appropriate for position control.
+            sleep(CONTROL_RATE)
+
+        # (Unreachable — loop exits via return inside the while True block)
